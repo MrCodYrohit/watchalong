@@ -1,0 +1,12 @@
+{
+  "name": "SyncStream - Multi-Platform Watch-Along",
+  "description": "Real-time peer-to-peer watch party platform to sync and stream Netflix, YouTube, Prime Video with friends via screen sharing, WebRTC live audio/video, and chat.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "display-capture"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
