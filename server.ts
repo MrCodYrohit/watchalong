@@ -69,7 +69,9 @@ async function startServer() {
   // REST API Endpoints
   app.post('/api/auth/validate-code', (req, res) => {
     const { code } = req.body;
-    if (typeof code === 'string' && code.trim().toLowerCase() === SECRET_CODE.toLowerCase()) {
+    const cleanInput = typeof code === 'string' ? code.trim().toLowerCase() : '';
+
+    if (SECRET_CODE && cleanInput && cleanInput === SECRET_CODE.toLowerCase()) {
       return res.json({
         success: true,
         message: 'Authentication successful',

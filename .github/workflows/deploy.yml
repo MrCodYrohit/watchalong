@@ -39,6 +39,8 @@ jobs:
 
       - name: Build static site
         run: npm run build
+        env:
+          VITE_SECRET_ROOM_CODE: ${{ secrets.VITE_SECRET_ROOM_CODE }}
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
