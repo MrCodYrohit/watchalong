@@ -6,6 +6,7 @@
  * continues to flow 100% Peer-to-Peer directly via WebRTC at full resolution.
  */
 import mqtt, { MqttClient } from 'mqtt';
+import { validateSecretCode } from '../config';
 
 const PUBLIC_BROKERS = [
   'wss://broker.emqx.io:8084/mqtt',
@@ -383,9 +384,7 @@ export class ServerlessSignalingSocket implements SignalingSocket {
         this.roomId = roomId;
 
         // Passcode validation
-        const validCode = 'rohit ko baap बोल 15'.toLowerCase(); // supports both
-        const inputCode = (secretCode || '').trim().toLowerCase();
-        const isCodeValid = inputCode === 'rohit ko baap bol 15' || inputCode === validCode;
+        const isCodeValid = validateSecretCode(secretCode);
         const isInviteValid = inviteToken && (inviteToken.startsWith('inv_') || inviteToken.length > 3);
 
         if (!isCodeValid && !isInviteValid) {

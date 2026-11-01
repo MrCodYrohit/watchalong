@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { Film, Lock, Sparkles, Tv, Users, Volume2, ArrowRight, CheckCircle2, AlertTriangle } from 'lucide-react';
+import { validateSecretCode } from '../config';
 
 interface LandingGateProps {
   onAuthenticated: (token: string, enteredCode: string) => void;
@@ -45,8 +46,7 @@ export const LandingGate: React.FC<LandingGateProps> = ({
     }
 
     // Direct verification for 100% static GitHub Pages deployment
-    const normalized = code.trim().toLowerCase();
-    if (normalized === 'rohit ko baap bol 15') {
+    if (validateSecretCode(code)) {
       onAuthenticated(`AUTH_${Date.now()}`, code.trim());
     } else {
       setError('Invalid Secret Code. Access denied.');

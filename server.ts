@@ -11,7 +11,12 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const isProduction = process.env.NODE_ENV === 'production';
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const SECRET_CODE = (process.env.SECRET_CODE || 'Rohit ko baap bol 15').trim();
+const SECRET_CODE = (
+  process.env.SECRET_ROOM_CODE ||
+  process.env.VITE_SECRET_ROOM_CODE ||
+  process.env.SECRET_CODE ||
+  ''
+).trim();
 
 interface Participant {
   socketId: string;
@@ -121,7 +126,7 @@ async function startServer() {
         if (!isCodeValid) {
           socket.emit('join-error', {
             code: 'SECRET_REQUIRED_TO_CREATE',
-            message: 'You cannot create a new watch party without the secret passcode ("Rohit ko baap bol 15").',
+            message: 'You cannot create a new watch party without the secret passcode.',
           });
           return;
         }

@@ -3,6 +3,7 @@ import { LandingGate } from './components/LandingGate';
 import { Lobby } from './components/Lobby';
 import { WatchPartyRoom } from './components/WatchPartyRoom';
 import { getSocket, resetSocket } from './services/socket';
+import { validateSecretCode } from './config';
 
 type AppStep = 'gate' | 'lobby' | 'party';
 
@@ -111,10 +112,7 @@ export default function App() {
         <Lobby
           initialRoomId={initialRoomId}
           isInviteLink={isInviteLink}
-          hasPasscode={
-            enteredPasscode.trim().toLowerCase() === 'rohit ko baap bol 15' ||
-            enteredPasscode.trim().toLowerCase() === 'rohit ko baap बोल 15'
-          }
+          hasPasscode={validateSecretCode(enteredPasscode)}
           onJoinRoom={handleJoinParty}
           onBackToGate={() => {
             setGateMessage(null);
