@@ -18,6 +18,37 @@ export const ParticipantTile: React.FC<ParticipantTileProps> = ({
   const videoRef = useRef<HTMLVideoElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const [audioLevel, setAudioLevel] = useState<number>(0);
+  const [, setTrackVersion] = useState<number>(0);
+
+  // Dynamic track listener: updates rendering as soon as video or audio track is added or unmuted
+  useEffect(() => {
+    if (!stream) return;
+    const handleTrackChange = () => {
+      setTrackVersion((v) => v + 1);
+      if (videoRef.current && videoRef.current.srcObject === stream) {
+        videoRef.current.play().catch(() => {});
+      }
+      if (!isSelf && audioRef.current && audioRef.current.srcObject === stream) {
+        audioRef.current.play().catch(() => {});
+      }
+    };
+
+    stream.addEventListener('addtrack', handleTrackChange);
+    stream.addEventListener('removetrack', handleTrackChange);
+    stream.getTracks().forEach((track) => {
+      track.addEventListener('unmute', handleTrackChange);
+      track.addEventListener('mute', handleTrackChange);
+    });
+
+    return () => {
+      stream.removeEventListener('addtrack', handleTrackChange);
+      stream.removeEventListener('removetrack', handleTrackChange);
+      stream.getTracks().forEach((track) => {
+        track.removeEventListener('unmute', handleTrackChange);
+        track.removeEventListener('mute', handleTrackChange);
+      });
+    };
+  }, [stream, isSelf]);
 
   useEffect(() => {
     if (videoRef.current) {
@@ -32,12 +63,16 @@ export const ParticipantTile: React.FC<ParticipantTileProps> = ({
 
   // Handle remote audio playback via dedicated audio element
   useEffect(() => {
-    if (!isSelf && audioRef.current && stream) {
-      audioRef.current.srcObject = stream;
-      audioRef.current.volume = 1.0;
-      audioRef.current.play().catch((err) => {
-        console.warn('[ParticipantTile] Audio autoplay policy prevented initial playback:', err);
-      });
+    if (!isSelf && audioRef.current) {
+      if (stream) {
+        audioRef.current.srcObject = stream;
+        audioRef.current.volume = 1.0;
+        audioRef.current.play().catch((err) => {
+          console.warn('[ParticipantTile] Audio autoplay policy prevented initial playback:', err);
+        });
+      } else {
+        audioRef.current.srcObject = null;
+      }
     }
   }, [stream, isSelf]);
 

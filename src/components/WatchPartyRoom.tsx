@@ -187,6 +187,15 @@ export const WatchPartyRoom: React.FC<WatchPartyRoomProps> = ({
         console.log('📡 Sending active screen stream to new participant:', actualPeer.socketId);
         webrtc.sendScreenStreamTo(actualPeer.socketId, activeStream);
       }
+
+      // Ensure webcam/mic connection is bidirectional and active
+      setTimeout(() => {
+        const peer = webrtc.getCamPeer(actualPeer.socketId);
+        if (!peer || (peer.connectionState !== 'connected' && peer.iceConnectionState !== 'connected')) {
+          console.log('📡 Settle check: initiating cam connection to:', actualPeer.socketId);
+          webrtc.initiateCamConnection(actualPeer.socketId);
+        }
+      }, 700);
     });
 
     // Screen stream requested by a peer (e.g. joined late or retried)

@@ -75,6 +75,10 @@ export class WebRTCManager {
     this.localSocketId = id;
   }
 
+  getCamPeer(id: string): RTCPeerConnection | undefined {
+    return this.camPeers.get(id);
+  }
+
   private setupSocketListeners() {
     this.socket.on('signal', async ({ senderSocketId, signalData, type, streamKind }: {
       senderSocketId: string;
@@ -137,14 +141,15 @@ export class WebRTCManager {
     pc.ontrack = (event) => {
       let stream = this.remoteCamMediaStreams.get(targetSocketId);
       if (!stream) {
-        stream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream();
-        this.remoteCamMediaStreams.set(targetSocketId, stream);
+        stream = new MediaStream();
       }
       if (!stream.getTracks().some((t) => t.id === event.track.id)) {
         stream.addTrack(event.track);
       }
-      console.log(`[WebRTC] Received remote ${event.track.kind} track from ${targetSocketId}`);
-      this.events.onRemoteCamStream?.(targetSocketId, stream);
+      const clonedStream = new MediaStream(stream.getTracks());
+      this.remoteCamMediaStreams.set(targetSocketId, clonedStream);
+      console.log(`[WebRTC] Received remote ${event.track.kind} track from ${targetSocketId}, total tracks: ${clonedStream.getTracks().length}`);
+      this.events.onRemoteCamStream?.(targetSocketId, clonedStream);
     };
 
     // Add audio and video transceivers upfront so SDP negotiation is fully bidirectional
@@ -209,38 +214,59 @@ export class WebRTCManager {
         pc.ontrack = (event) => {
           let stream = this.remoteCamMediaStreams.get(senderSocketId);
           if (!stream) {
-            stream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream();
-            this.remoteCamMediaStreams.set(senderSocketId, stream);
+            stream = new MediaStream();
           }
           if (!stream.getTracks().some((t) => t.id === event.track.id)) {
             stream.addTrack(event.track);
           }
-          console.log(`[WebRTC] Received remote ${event.track.kind} track from ${senderSocketId}`);
-          this.events.onRemoteCamStream?.(senderSocketId, stream);
+          const clonedStream = new MediaStream(stream.getTracks());
+          this.remoteCamMediaStreams.set(senderSocketId, clonedStream);
+          console.log(`[WebRTC] Received remote ${event.track.kind} track from ${senderSocketId}, total tracks: ${clonedStream.getTracks().length}`);
+          this.events.onRemoteCamStream?.(senderSocketId, clonedStream);
         };
       }
 
-      // Add transceivers or attach tracks
-      const senders = pc.getSenders();
-      const hasAudioSender = senders.some((s) => s.track?.kind === 'audio');
-      const hasVideoSender = senders.some((s) => s.track?.kind === 'video');
+      // Step 1: Set remote description FIRST before adjusting transceivers!
+      await pc.setRemoteDescription(new RTCSessionDescription(signalData as RTCSessionDescriptionInit));
 
-      if (!hasAudioSender) {
-        const audioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
+      // Step 2: Bind local tracks to the incoming transceivers
+      const transceivers = pc.getTransceivers();
+      const audioTransceiver = transceivers.find(
+        (t) => t.receiver?.track?.kind === 'audio' || t.sender?.track?.kind === 'audio'
+      );
+      const videoTransceiver = transceivers.find(
+        (t) => t.receiver?.track?.kind === 'video' || t.sender?.track?.kind === 'video'
+      );
+
+      if (audioTransceiver) {
+        audioTransceiver.direction = 'sendrecv';
         const aTrack = this.localCamStream?.getAudioTracks()[0];
         if (aTrack && audioTransceiver.sender) {
-          audioTransceiver.sender.replaceTrack(aTrack).catch(() => {});
+          await audioTransceiver.sender.replaceTrack(aTrack).catch((err) => {
+            console.warn('[WebRTC] Error attaching audio track to answerer transceiver:', err);
+          });
         }
-      }
-      if (!hasVideoSender) {
-        const videoTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
-        const vTrack = this.localCamStream?.getVideoTracks()[0];
-        if (vTrack && videoTransceiver.sender) {
-          videoTransceiver.sender.replaceTrack(vTrack).catch(() => {});
+      } else {
+        const aTrack = this.localCamStream?.getAudioTracks()[0];
+        if (aTrack) {
+          try { pc.addTrack(aTrack, this.localCamStream!); } catch (_) {}
         }
       }
 
-      await pc.setRemoteDescription(new RTCSessionDescription(signalData as RTCSessionDescriptionInit));
+      if (videoTransceiver) {
+        videoTransceiver.direction = 'sendrecv';
+        const vTrack = this.localCamStream?.getVideoTracks()[0];
+        if (vTrack && videoTransceiver.sender) {
+          await videoTransceiver.sender.replaceTrack(vTrack).catch((err) => {
+            console.warn('[WebRTC] Error attaching video track to answerer transceiver:', err);
+          });
+        }
+      } else {
+        const vTrack = this.localCamStream?.getVideoTracks()[0];
+        if (vTrack) {
+          try { pc.addTrack(vTrack, this.localCamStream!); } catch (_) {}
+        }
+      }
 
       const queued = this.pendingCamCandidates.get(senderSocketId) || [];
       for (const cand of queued) {
