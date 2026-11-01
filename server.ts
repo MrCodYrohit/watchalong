@@ -86,13 +86,14 @@ async function startServer() {
   app.get('/api/rooms/:roomId/status', (req, res) => {
     const { roomId } = req.params;
     const room = rooms.get(roomId);
-    if (!room) {
-      return res.json({ exists: false, count: 0 });
+    if (!room || room.participants.size === 0) {
+      return res.json({ exists: false, count: 0, active: false });
     }
     return res.json({
       exists: true,
       count: room.participants.size,
       hasScreenShare: !!room.activeScreenSharer,
+      active: true,
     });
   });
 
@@ -107,12 +108,24 @@ async function startServer() {
       const isInviteValid = inviteToken && (inviteToken.startsWith('inv_') || inviteToken.length > 4);
 
       if (!isCodeValid && !isInviteValid) {
-        socket.emit('join-error', { message: 'Invalid credentials or expired invite link.' });
+        socket.emit('join-error', { code: 'INVALID_CREDENTIALS', message: 'Invalid credentials or expired invite link.' });
         return;
       }
 
       currentRoomId = roomId;
       let room = rooms.get(roomId);
+
+      // STRICT CREATION RESTRICTION:
+      // If the room does not exist or is empty, creating a new room STRICTLY REQUIRES the secret code!
+      if (!room || room.participants.size === 0) {
+        if (!isCodeValid) {
+          socket.emit('join-error', {
+            code: 'SECRET_REQUIRED_TO_CREATE',
+            message: 'You cannot create a new watch party without the secret passcode ("Rohit ko baap bol 15").',
+          });
+          return;
+        }
+      }
 
       if (!room) {
         room = {
@@ -306,8 +319,14 @@ async function startServer() {
       });
     });
 
-    // Handle user disconnect
-    socket.on('disconnect', () => {
+    // Soundcheck ping broadcast to room
+    socket.on('soundcheck-ping', ({ senderName }) => {
+      if (!currentRoomId) return;
+      socket.to(currentRoomId).emit('soundcheck-ping', { senderName });
+    });
+
+    // Handle user leave or disconnect
+    const handleUserLeave = () => {
       if (!currentRoomId || !currentUser) return;
       const room = rooms.get(currentRoomId);
       if (!room) return;
@@ -336,16 +355,14 @@ async function startServer() {
       room.messages.push(leaveMsg);
       socket.to(currentRoomId).emit('chat-message', leaveMsg);
 
-      // Clean up empty room after grace period
+      // Clean up room immediately if empty so old invite link cannot be reused
       if (room.participants.size === 0) {
-        setTimeout(() => {
-          const checkRoom = rooms.get(currentRoomId!);
-          if (checkRoom && checkRoom.participants.size === 0) {
-            rooms.delete(currentRoomId!);
-          }
-        }, 60000);
+        rooms.delete(currentRoomId!);
       }
-    });
+    };
+
+    socket.on('leave-room', handleUserLeave);
+    socket.on('disconnect', handleUserLeave);
   });
 
   // Vite middleware in dev or static serving in prod

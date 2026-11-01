@@ -85,6 +85,29 @@ class SoundService {
     }
   }
 
+  playLeave() {
+    if (!this.enabled) return;
+    try {
+      this.initCtx();
+      if (!this.ctx) return;
+      const now = this.ctx.currentTime;
+      [783.99, 659.25, 523.25].forEach((freq, idx) => {
+        const osc = this.ctx!.createOscillator();
+        const gain = this.ctx!.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.06, now + idx * 0.07);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + idx * 0.07 + 0.2);
+        osc.connect(gain);
+        gain.connect(this.ctx!.destination);
+        osc.start(now + idx * 0.07);
+        osc.stop(now + idx * 0.07 + 0.2);
+      });
+    } catch {
+      // ignore
+    }
+  }
+
   playStreamStart() {
     if (!this.enabled) return;
     try {
@@ -102,6 +125,34 @@ class SoundService {
         gain.connect(this.ctx!.destination);
         osc.start(now + idx * 0.06);
         osc.stop(now + idx * 0.06 + 0.3);
+      });
+    } catch {
+      // ignore
+    }
+  }
+
+  async playTestChime() {
+    if (!this.enabled) return;
+    try {
+      this.initCtx();
+      if (!this.ctx) return;
+      if (this.ctx.state === 'suspended') {
+        await this.ctx.resume().catch(() => {});
+      }
+      const now = this.ctx.currentTime;
+      // Resonant 4-tone ascending soundcheck chime (C5, E5, G5, C6)
+      const freqs = [523.25, 659.25, 783.99, 1046.50];
+      freqs.forEach((freq, idx) => {
+        const osc = this.ctx!.createOscillator();
+        const gain = this.ctx!.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.20, now + idx * 0.1);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + idx * 0.1 + 0.5);
+        osc.connect(gain);
+        gain.connect(this.ctx!.destination);
+        osc.start(now + idx * 0.1);
+        osc.stop(now + idx * 0.1 + 0.5);
       });
     } catch {
       // ignore

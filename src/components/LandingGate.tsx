@@ -1,12 +1,17 @@
 import React, { useState } from 'react';
-import { Film, Lock, Sparkles, Tv, Users, Volume2, ArrowRight, CheckCircle2 } from 'lucide-react';
+import { Film, Lock, Sparkles, Tv, Users, Volume2, ArrowRight, CheckCircle2, AlertTriangle } from 'lucide-react';
 
 interface LandingGateProps {
   onAuthenticated: (token: string, enteredCode: string) => void;
   initialCode?: string;
+  infoMessage?: string | null;
 }
 
-export const LandingGate: React.FC<LandingGateProps> = ({ onAuthenticated, initialCode = '' }) => {
+export const LandingGate: React.FC<LandingGateProps> = ({
+  onAuthenticated,
+  initialCode = '',
+  infoMessage = null,
+}) => {
   const [code, setCode] = useState(initialCode);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -86,6 +91,16 @@ export const LandingGate: React.FC<LandingGateProps> = ({ onAuthenticated, initi
               Secret Passcode Gatekeeper
             </h2>
           </div>
+
+          {infoMessage && (
+            <div className="mb-6 p-4 rounded-2xl bg-amber-500/10 border border-amber-500/25 text-amber-200 text-xs flex items-start gap-3 leading-relaxed shadow-inner">
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <div>
+                <div className="font-bold text-amber-300 mb-0.5">Invite Link Expired</div>
+                <p className="text-[11px] text-amber-200/90">{infoMessage}</p>
+              </div>
+            </div>
+          )}
 
           <form onSubmit={handleSubmit} className="space-y-4">
             <div>

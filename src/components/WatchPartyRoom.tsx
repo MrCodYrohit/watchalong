@@ -34,6 +34,7 @@ import {
 } from '../types';
 import { WebRTCManager } from '../services/webrtc';
 import { sound } from '../services/sound';
+import { createVirtualCameraTrack } from '../services/virtualCam';
 import { ParticipantTile } from './ParticipantTile';
 import { ReactionFloatingLayer } from './ReactionFloatingLayer';
 import { ScreenShareGuideModal } from './ScreenShareGuideModal';
@@ -47,6 +48,7 @@ interface WatchPartyRoomProps {
   initialVideoMuted: boolean;
   socket: SignalingSocket | Socket;
   onLeaveRoom: () => void;
+  onJoinError?: (errorMessage: string) => void;
 }
 
 export const WatchPartyRoom: React.FC<WatchPartyRoomProps> = ({
@@ -58,7 +60,13 @@ export const WatchPartyRoom: React.FC<WatchPartyRoomProps> = ({
   initialVideoMuted,
   socket,
   onLeaveRoom,
+  onJoinError,
 }) => {
+  const onJoinErrorRef = useRef(onJoinError);
+  onJoinErrorRef.current = onJoinError;
+  const onLeaveRoomRef = useRef(onLeaveRoom);
+  onLeaveRoomRef.current = onLeaveRoom;
+
   // Room state
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [activeScreenSharer, setActiveScreenSharer] = useState<ScreenSharerInfo | null>(null);
@@ -83,6 +91,7 @@ export const WatchPartyRoom: React.FC<WatchPartyRoomProps> = ({
   const [streamVolume, setStreamVolume] = useState<number>(100); // 0 to 200%
   const [isStreamMuted, setIsStreamMuted] = useState(false);
   const [hasScreenAudio, setHasScreenAudio] = useState(false);
+  const [soundcheckToast, setSoundcheckToast] = useState<string | null>(null);
 
   // WebRTC streams
   const [localCamStream, setLocalCamStream] = useState<MediaStream | null>(null);
@@ -172,9 +181,6 @@ export const WatchPartyRoom: React.FC<WatchPartyRoomProps> = ({
         return [...prev, actualPeer];
       });
       sound.playJoin();
-      // Connect webcam pipeline
-      webrtc.initiateCamConnection(actualPeer.socketId);
-
       // If we are currently sharing screen, send the stream to this new participant!
       const activeStream = webrtcRef.current?.localScreenStream || webrtc.localScreenStream;
       if (activeStream) {
@@ -194,10 +200,19 @@ export const WatchPartyRoom: React.FC<WatchPartyRoomProps> = ({
 
     socket.on('user-left', ({ socketId }: { socketId: string }) => {
       setParticipants((prev) => prev.filter((p) => p.socketId !== socketId));
+      setRemoteCamStreams((prev) => {
+        const next = new Map(prev);
+        next.delete(socketId);
+        return next;
+      });
       if (activeScreenSharer?.socketId === socketId) {
         setActiveScreenSharer(null);
         setRemoteScreenStream(null);
+        setHasScreenAudio(false);
       }
+      webrtcRef.current?.closeCamPeer(socketId);
+      webrtcRef.current?.closeScreenPeer(socketId);
+      sound.playLeave();
     });
 
     socket.on('user-media-state', ({ socketId, isAudioMuted, isVideoMuted }) => {
@@ -226,7 +241,10 @@ export const WatchPartyRoom: React.FC<WatchPartyRoomProps> = ({
     });
 
     socket.on('chat-message', (message: ChatMessage) => {
-      setMessages((prev) => [...prev, message]);
+      setMessages((prev) => {
+        if (prev.some((m) => m.id === message.id)) return prev;
+        return [...prev, message];
+      });
       if (message.senderId !== socket.id) {
         sound.playChirp();
         if (!isSidebarOpen || sidebarTab !== 'chat') {
@@ -240,27 +258,67 @@ export const WatchPartyRoom: React.FC<WatchPartyRoomProps> = ({
       sound.playPop();
     });
 
-    // Start local camera & microphone
-    navigator.mediaDevices
-      .getUserMedia({
-        video: true,
-        audio: true,
-      })
-      .then((stream) => {
-        setLocalCamStream(stream);
-        webrtc.updateLocalCamStream(stream);
+    socket.on('soundcheck-ping', ({ senderName }: { senderName: string }) => {
+      sound.playTestChime();
+      setSoundcheckToast(`🔔 ${senderName || 'A peer'} played an audio soundcheck chime!`);
+      setTimeout(() => setSoundcheckToast(null), 3500);
+    });
 
-        // Apply initial mute states
-        stream.getAudioTracks().forEach((track) => {
+    socket.on('join-error', (err: any) => {
+      console.warn('Socket join-error in room:', err);
+      if (onJoinErrorRef.current) {
+        onJoinErrorRef.current(err?.message || 'This invite link has expired because everyone has left the watch party.');
+      }
+    });
+
+    // Start local camera & microphone with automatic fallback for single-device multi-tab testing
+    const initLocalMedia = async () => {
+      let audioStream: MediaStream | null = null;
+      let videoTrack: MediaStreamTrack | null = null;
+
+      try {
+        const fullStream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: true,
+        });
+        audioStream = fullStream;
+        videoTrack = fullStream.getVideoTracks()[0] || null;
+      } catch (err: any) {
+        console.warn('[WatchPartyRoom] getUserMedia full error, trying fallback:', err?.name, err?.message);
+        // Step 1: try acquiring audio separately (mics can be shared or accessed when camera is locked)
+        try {
+          audioStream = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+          });
+        } catch (audioErr) {
+          console.warn('[WatchPartyRoom] Audio acquire error:', audioErr);
+        }
+
+        // Step 2: if camera hardware is locked by another tab on this PC (NotReadableError)
+        // or user denied camera, generate animated virtual test camera feed
+        videoTrack = createVirtualCameraTrack(displayName, avatar);
+      }
+
+      const activeTracks: MediaStreamTrack[] = [];
+      if (audioStream) {
+        audioStream.getAudioTracks().forEach((track) => {
           track.enabled = !initialAudioMuted;
+          activeTracks.push(track);
         });
-        stream.getVideoTracks().forEach((track) => {
-          track.enabled = !initialVideoMuted;
-        });
-      })
-      .catch((err) => {
-        console.warn('Could not initialize local webcam/microphone:', err);
-      });
+      }
+      if (videoTrack) {
+        videoTrack.enabled = !initialVideoMuted;
+        activeTracks.push(videoTrack);
+      }
+
+      if (activeTracks.length > 0) {
+        const compositeStream = new MediaStream(activeTracks);
+        setLocalCamStream(compositeStream);
+        webrtc.updateLocalCamStream(compositeStream);
+      }
+    };
+
+    initLocalMedia();
 
     return () => {
       webrtc.destroy();
@@ -273,8 +331,10 @@ export const WatchPartyRoom: React.FC<WatchPartyRoomProps> = ({
       socket.off('screen-share-stopped');
       socket.off('chat-message');
       socket.off('reaction');
+      socket.off('soundcheck-ping');
+      socket.off('join-error');
     };
-  }, [socket, initialAudioMuted, initialVideoMuted]);
+  }, [socket, roomId]);
 
   // Attach screen stream to video player
   useEffect(() => {
@@ -626,6 +686,27 @@ export const WatchPartyRoom: React.FC<WatchPartyRoomProps> = ({
     }
   };
 
+  // Leave Watch Party cleanly
+  const handleLeaveParty = () => {
+    if (localCamStream) {
+      localCamStream.getTracks().forEach((t) => t.stop());
+    }
+    if (isSharingScreen) {
+      stopScreenShare();
+    }
+    socket.emit('leave-room');
+    webrtcRef.current?.destroy();
+    onLeaveRoom();
+  };
+
+  // Trigger Soundcheck Tone across party
+  const handleTriggerSoundcheck = () => {
+    sound.playTestChime();
+    socket.emit('soundcheck-ping', { senderName: displayName });
+    setSoundcheckToast('🔔 Playing audio soundcheck chime across the room...');
+    setTimeout(() => setSoundcheckToast(null), 3000);
+  };
+
   const selfParticipant: Participant = {
     socketId: socket.id || 'self',
     displayName,
@@ -653,6 +734,13 @@ export const WatchPartyRoom: React.FC<WatchPartyRoomProps> = ({
     <div className="min-h-screen h-screen flex flex-col bg-zinc-950 text-zinc-100 overflow-hidden select-none font-['Plus_Jakarta_Sans']">
       {/* Floating Reaction Layer */}
       <ReactionFloatingLayer reactions={reactions} />
+
+      {/* Soundcheck Notification Toast */}
+      {soundcheckToast && (
+        <div className="fixed top-16 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-xl bg-amber-400 text-black font-bold text-xs shadow-xl backdrop-blur-md flex items-center gap-2 animate-bounce">
+          <span>{soundcheckToast}</span>
+        </div>
+      )}
 
       {/* Screen Share Audio Guide Modal */}
       <ScreenShareGuideModal
@@ -706,6 +794,14 @@ export const WatchPartyRoom: React.FC<WatchPartyRoomProps> = ({
             >
               <span>+ Test 2nd User</span>
             </a>
+            <button
+              onClick={handleTriggerSoundcheck}
+              className="hidden sm:flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/30 text-[11px] font-semibold transition-colors cursor-pointer"
+              title="Test audio chime across all participants to verify speakers"
+            >
+              <Volume2 className="w-3 h-3 text-amber-400" />
+              <span>Soundcheck</span>
+            </button>
           </div>
 
           {/* Live Indicator */}
@@ -787,7 +883,7 @@ export const WatchPartyRoom: React.FC<WatchPartyRoomProps> = ({
 
           {/* Leave Room Button */}
           <button
-            onClick={onLeaveRoom}
+            onClick={handleLeaveParty}
             className="flex items-center gap-1 px-3 py-1.5 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/30 text-xs font-semibold transition-colors cursor-pointer"
           >
             <PhoneOff className="w-3.5 h-3.5" />
@@ -941,9 +1037,9 @@ export const WatchPartyRoom: React.FC<WatchPartyRoomProps> = ({
                       <div className="text-[11px] font-semibold text-zinc-300">1. Select Tab</div>
                       <div className="text-[10px] text-zinc-500 mt-0.5">Pick the Netflix or YouTube tab</div>
                     </div>
-                    <div className="p-2.5 rounded-xl bg-rose-500/10 border border-rose-500/20">
-                      <div className="text-[11px] font-semibold text-rose-300">2. Share Audio</div>
-                      <div className="text-[10px] text-zinc-400 mt-0.5">Check the tab audio toggle</div>
+                    <div className="p-2.5 rounded-xl bg-zinc-950/60 border border-zinc-800/60">
+                      <div className="text-[11px] font-semibold text-zinc-300">2. Share Audio</div>
+                      <div className="text-[10px] text-zinc-500 mt-0.5">Check the tab audio toggle</div>
                     </div>
                     <div className="p-2.5 rounded-xl bg-zinc-950/60 border border-zinc-800/60">
                       <div className="text-[11px] font-semibold text-zinc-300">3. Sync & Enjoy</div>
@@ -1262,6 +1358,16 @@ export const WatchPartyRoom: React.FC<WatchPartyRoomProps> = ({
           >
             {!isVideoMuted ? <Video className="w-4 h-4 text-zinc-200" /> : <VideoOff className="w-4 h-4" />}
             <span className="hidden sm:inline">{!isVideoMuted ? 'Stop Cam' : 'Start Cam'}</span>
+          </button>
+
+          {/* Soundcheck / Test Audio Button */}
+          <button
+            onClick={handleTriggerSoundcheck}
+            className="flex items-center gap-2 px-3.5 py-2.5 rounded-2xl bg-zinc-800 hover:bg-zinc-700 text-amber-300 border border-amber-500/30 text-xs font-semibold transition-all cursor-pointer shadow-sm active:scale-95"
+            title="Play soundcheck chime on all devices to verify room audio and speakers"
+          >
+            <Volume2 className="w-4 h-4 text-amber-400" />
+            <span className="hidden sm:inline">Soundcheck</span>
           </button>
 
           {/* Screen Share Toggle */}

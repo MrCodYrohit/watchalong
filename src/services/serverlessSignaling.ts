@@ -3,7 +3,7 @@
  * 
  * Replaces the need for a dedicated Node.js signaling server by using public,
  * encrypted WebSockets (WSS) over MQTT. Media (screen share, audio, video)
- * continues to flow 100% Peer-to-Peer directly via WebRTC at full 25 Mbps resolution.
+ * continues to flow 100% Peer-to-Peer directly via WebRTC at full resolution.
  */
 import mqtt, { MqttClient } from 'mqtt';
 
@@ -30,13 +30,30 @@ export class ServerlessSignalingSocket implements SignalingSocket {
   private roomId: string | null = null;
   private currentUser: any = null;
   private peers: Map<string, any> = new Map();
+  private peerLastSeen: Map<string, number> = new Map();
   private activeScreenSharer: any = null;
   private isConnected: boolean = false;
   private brokerIndex: number = 0;
   private hasJoinedRoom: boolean = false;
+  private heartbeatInterval: number | null = null;
+  private staleCheckInterval: number | null = null;
+  private unloadHandler: (() => void) | null = null;
+  private pendingJoinCallback: (() => void) | null = null;
+  private lastSoundcheckTime: number = 0;
 
   constructor() {
     this.id = `peer_${Math.random().toString(36).substring(2, 9)}_${Date.now().toString(36).slice(-4)}`;
+    this.setupUnloadHandler();
+  }
+
+  private setupUnloadHandler() {
+    this.unloadHandler = () => {
+      this.broadcastLeave();
+    };
+    if (typeof window !== 'undefined') {
+      window.addEventListener('beforeunload', this.unloadHandler);
+      window.addEventListener('pagehide', this.unloadHandler);
+    }
   }
 
   public on(event: string, callback: EventCallback) {
@@ -71,15 +88,28 @@ export class ServerlessSignalingSocket implements SignalingSocket {
     if (this.client) return;
 
     const brokerUrl = PUBLIC_BROKERS[this.brokerIndex % PUBLIC_BROKERS.length];
-    console.log(`[P2P Signaling] Connecting to public broker: ${brokerUrl}`);
+    console.log(`[P2P Signaling] Connecting to broker: ${brokerUrl}`);
 
     try {
       this.client = mqtt.connect(brokerUrl, {
         clientId: `sync_${this.id}`,
         clean: true,
-        connectTimeout: 5000,
+        connectTimeout: 6000,
         keepalive: 30,
-        reconnectPeriod: 2000,
+        reconnectPeriod: 2500,
+        will: this.roomId
+          ? {
+              topic: `syncstream/v2/${this.roomId}/all`,
+              payload: JSON.stringify({
+                type: 'user-left',
+                senderSocketId: this.id,
+                socketId: this.id,
+                displayName: this.currentUser?.displayName || 'Friend',
+              }),
+              qos: 0,
+              retain: false,
+            }
+          : undefined,
       });
 
       this.client.on('connect', () => {
@@ -103,7 +133,6 @@ export class ServerlessSignalingSocket implements SignalingSocket {
 
       this.client.on('error', (err) => {
         console.warn(`[P2P Signaling] Broker error on ${brokerUrl}:`, err.message);
-        // Try fallback broker on error
         this.brokerIndex++;
       });
 
@@ -126,18 +155,60 @@ export class ServerlessSignalingSocket implements SignalingSocket {
       if (err) {
         console.error('[P2P Signaling] Subscription error:', err);
       } else {
-        console.log(`[P2P Signaling] Subscribed to room topics for ${roomId}`);
+        console.log(`[P2P Signaling] Subscribed to room ${roomId}`);
       }
     });
+
+    this.startHeartbeat(roomId);
+  }
+
+  private startHeartbeat(roomId: string) {
+    if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
+    if (this.staleCheckInterval) clearInterval(this.staleCheckInterval);
+
+    // Ping every 5 seconds to keep room presence alive
+    this.heartbeatInterval = window.setInterval(() => {
+      if (this.isConnected && this.hasJoinedRoom) {
+        this.publish(`syncstream/v2/${roomId}/all`, {
+          type: 'presence-ping',
+          senderSocketId: this.id,
+          peer: this.currentUser,
+        });
+      }
+    }, 5000);
+
+    // Check for stale peers every 5 seconds
+    this.staleCheckInterval = window.setInterval(() => {
+      const now = Date.now();
+      this.peers.forEach((peer, peerId) => {
+        const lastSeen = this.peerLastSeen.get(peerId) || 0;
+        // If no heartbeat for > 15 seconds, participant has disconnected
+        if (now - lastSeen > 15000) {
+          console.log(`[P2P Signaling] Peer ${peerId} timed out. Removing from party.`);
+          this.peers.delete(peerId);
+          this.peerLastSeen.delete(peerId);
+          if (this.activeScreenSharer?.socketId === peerId) {
+            this.activeScreenSharer = null;
+          }
+          this.trigger('user-left', {
+            socketId: peerId,
+            displayName: peer.displayName || 'Friend',
+          });
+        }
+      });
+    }, 5000);
   }
 
   private publish(topic: string, data: any) {
     if (!this.client || !this.isConnected) {
-      // If not yet connected, retry shortly
       setTimeout(() => this.publish(topic, data), 200);
       return;
     }
-    this.client.publish(topic, JSON.stringify(data), { qos: 0 });
+    try {
+      this.client.publish(topic, JSON.stringify(data), { qos: 0 });
+    } catch (e) {
+      console.warn('[P2P Signaling] Publish error:', e);
+    }
   }
 
   private handleIncomingMessage(_topic: string, msg: any) {
@@ -146,9 +217,31 @@ export class ServerlessSignalingSocket implements SignalingSocket {
       return;
     }
 
+    // Record last seen for presence
+    if (msg.senderSocketId) {
+      this.peerLastSeen.set(msg.senderSocketId, Date.now());
+    }
+
     switch (msg.type) {
+      case 'presence-ping': {
+        const peer = msg.peer;
+        if (peer && peer.socketId && peer.socketId !== this.id) {
+          this.peerLastSeen.set(peer.socketId, Date.now());
+          if (!this.peers.has(peer.socketId)) {
+            this.peers.set(peer.socketId, peer);
+            if (this.hasJoinedRoom) {
+              this.trigger('user-joined', peer);
+            } else if (this.pendingJoinCallback) {
+              const cb = this.pendingJoinCallback;
+              this.pendingJoinCallback = null;
+              cb();
+            }
+          }
+        }
+        break;
+      }
+
       case 'peer-announce': {
-        // Another peer joined the room
         const incomingPeer = msg.peer;
         if (!incomingPeer || !incomingPeer.socketId || incomingPeer.socketId === this.id) {
           break;
@@ -156,8 +249,9 @@ export class ServerlessSignalingSocket implements SignalingSocket {
 
         const isNew = !this.peers.has(incomingPeer.socketId);
         this.peers.set(incomingPeer.socketId, incomingPeer);
+        this.peerLastSeen.set(incomingPeer.socketId, Date.now());
 
-        // Tell them about our existence and current screen share state
+        // Welcome them back with our info & active screen sharer
         this.publish(`syncstream/v2/${this.roomId}/peer/${incomingPeer.socketId}`, {
           type: 'peer-welcome',
           senderSocketId: this.id,
@@ -172,27 +266,30 @@ export class ServerlessSignalingSocket implements SignalingSocket {
       }
 
       case 'peer-welcome': {
-        // Existing peer greeted us
         const peer = msg.peer;
         if (peer && peer.socketId && peer.socketId !== this.id) {
           const isNew = !this.peers.has(peer.socketId);
           this.peers.set(peer.socketId, peer);
+          this.peerLastSeen.set(peer.socketId, Date.now());
           if (msg.activeScreenSharer) {
             this.activeScreenSharer = msg.activeScreenSharer;
           }
           if (this.hasJoinedRoom && isNew) {
             this.trigger('user-joined', peer);
+          } else if (!this.hasJoinedRoom && this.pendingJoinCallback) {
+            const cb = this.pendingJoinCallback;
+            this.pendingJoinCallback = null;
+            cb();
           }
         }
         break;
       }
 
       case 'signal': {
-        // WebRTC SDP Offer / Answer or ICE Candidate
         this.trigger('signal', {
           senderSocketId: msg.senderSocketId,
           signalData: msg.signalData,
-          type: msg.signalType,
+          type: msg.signalType || msg.type,
           streamKind: msg.streamKind,
         });
         break;
@@ -219,11 +316,6 @@ export class ServerlessSignalingSocket implements SignalingSocket {
           isAudioMuted: msg.isAudioMuted,
           isVideoMuted: msg.isVideoMuted,
         });
-        this.trigger('media-state-changed', {
-          socketId: msg.socketId,
-          isAudioMuted: msg.isAudioMuted,
-          isVideoMuted: msg.isVideoMuted,
-        });
         break;
       }
 
@@ -242,7 +334,8 @@ export class ServerlessSignalingSocket implements SignalingSocket {
       }
 
       case 'chat-message': {
-        this.trigger('chat-message', msg.message);
+        const chatMsg = msg.message || msg;
+        this.trigger('chat-message', chatMsg);
         break;
       }
 
@@ -251,13 +344,27 @@ export class ServerlessSignalingSocket implements SignalingSocket {
         break;
       }
 
+      case 'soundcheck-ping': {
+        if (msg.senderSocketId !== this.id) {
+          const now = Date.now();
+          if (now - this.lastSoundcheckTime > 1000) {
+            this.lastSoundcheckTime = now;
+            this.trigger('soundcheck-ping', { senderName: msg.senderName });
+          }
+        }
+        break;
+      }
+
       case 'user-left': {
-        this.peers.delete(msg.socketId);
-        if (this.activeScreenSharer?.socketId === msg.socketId) {
+        const leftSocketId = msg.socketId || msg.senderSocketId;
+        console.log(`[P2P Signaling] Received user-left for:`, leftSocketId);
+        this.peers.delete(leftSocketId);
+        this.peerLastSeen.delete(leftSocketId);
+        if (this.activeScreenSharer?.socketId === leftSocketId) {
           this.activeScreenSharer = null;
         }
         this.trigger('user-left', {
-          socketId: msg.socketId,
+          socketId: leftSocketId,
           displayName: msg.displayName || 'Friend',
         });
         break;
@@ -276,8 +383,9 @@ export class ServerlessSignalingSocket implements SignalingSocket {
         this.roomId = roomId;
 
         // Passcode validation
-        const validCode = 'rohit ko baap bol 15';
-        const isCodeValid = secretCode && secretCode.trim().toLowerCase() === validCode;
+        const validCode = 'rohit ko baap बोल 15'.toLowerCase(); // supports both
+        const inputCode = (secretCode || '').trim().toLowerCase();
+        const isCodeValid = inputCode === 'rohit ko baap bol 15' || inputCode === validCode;
         const isInviteValid = inviteToken && (inviteToken.startsWith('inv_') || inviteToken.length > 3);
 
         if (!isCodeValid && !isInviteValid) {
@@ -294,10 +402,9 @@ export class ServerlessSignalingSocket implements SignalingSocket {
           isVideoMuted: false,
         };
 
-        // Note: this.peers ONLY tracks remote peers (never self)
         this.peers.clear();
+        this.peerLastSeen.clear();
 
-        // Ensure connected to broker
         if (!this.isConnected) {
           this.connect();
         }
@@ -324,7 +431,7 @@ export class ServerlessSignalingSocket implements SignalingSocket {
                 id: 'sys-welcome',
                 senderId: 'system',
                 senderName: 'SyncStream Bot',
-                text: `Welcome to room ${roomId}! P2P Watch Party ready.`,
+                text: `Welcome to room ${roomId}! Watch party live.`,
                 timestamp: Date.now(),
                 isSystem: true,
               },
@@ -332,31 +439,56 @@ export class ServerlessSignalingSocket implements SignalingSocket {
           });
         };
 
-        // Wait brief moment for initial MQTT subscriptions, then announce
+        this.pendingJoinCallback = fireRoomJoined;
+
         const announceTimer = setInterval(() => {
           if (this.isConnected && this.client) {
             clearInterval(announceTimer);
             this.subscribeToRoom(roomId);
 
-            // Announce to all peers in the room
             this.publish(`syncstream/v2/${roomId}/all`, {
               type: 'peer-announce',
               senderSocketId: this.id,
               peer: this.currentUser,
             });
 
-            // After 350ms, collect whatever peers have responded and trigger room-joined
-            setTimeout(() => {
-              fireRoomJoined();
-            }, 350);
+            if (isCodeValid) {
+              // Authorized host with secret code: fire room join after small settle delay
+              setTimeout(() => {
+                if (this.pendingJoinCallback) {
+                  const cb = this.pendingJoinCallback;
+                  this.pendingJoinCallback = null;
+                  cb();
+                }
+              }, 300);
+            } else {
+              // Invited guest without secret code: wait up to 2.5s for existing peers to reply
+              const timeoutId = window.setTimeout(() => {
+                if (!this.hasJoinedRoom) {
+                  this.pendingJoinCallback = null;
+                  const remote = getRemoteParticipants();
+                  if (remote.length === 0) {
+                    console.warn(`[P2P Signaling] Room ${roomId} has no active participants. Secret code required.`);
+                    this.trigger('join-error', {
+                      code: 'INVITE_EXPIRED_EMPTY_ROOM',
+                      message: 'This invite link has expired because everyone has left the watch party. Enter the secret code to start a new party.',
+                    });
+                    this.disconnect();
+                    return;
+                  }
+                  fireRoomJoined();
+                }
+              }, 2500);
+
+              // If a peer responded before timeout, cancel the timeout
+              const origCb = this.pendingJoinCallback;
+              this.pendingJoinCallback = () => {
+                clearTimeout(timeoutId);
+                if (origCb) origCb();
+              };
+            }
           }
         }, 50);
-
-        // Safety timeout for room-joined if broker is slow
-        setTimeout(() => {
-          clearInterval(announceTimer);
-          fireRoomJoined();
-        }, 1500);
 
         break;
       }
@@ -373,9 +505,8 @@ export class ServerlessSignalingSocket implements SignalingSocket {
       }
 
       case 'signal': {
-        // Direct P2P signaling to target peer
         const { targetSocketId, signalData, type, streamKind } = data;
-        if (!this.roomId) return;
+        if (!this.roomId || !targetSocketId) return;
         this.publish(`syncstream/v2/${this.roomId}/peer/${targetSocketId}`, {
           type: 'signal',
           senderSocketId: this.id,
@@ -386,6 +517,8 @@ export class ServerlessSignalingSocket implements SignalingSocket {
         break;
       }
 
+      // Support both screen-share-start and start-screen-share
+      case 'screen-share-start':
       case 'start-screen-share': {
         if (!this.roomId) return;
         const sharer = {
@@ -399,11 +532,12 @@ export class ServerlessSignalingSocket implements SignalingSocket {
           senderSocketId: this.id,
           sharer,
         });
-        // Also trigger locally
-        this.trigger('screen-share-started', { sharer });
+        this.trigger('screen-share-started', sharer);
         break;
       }
 
+      // Support both screen-share-stop and stop-screen-share
+      case 'screen-share-stop':
       case 'stop-screen-share': {
         if (!this.roomId) return;
         this.activeScreenSharer = null;
@@ -416,9 +550,11 @@ export class ServerlessSignalingSocket implements SignalingSocket {
         break;
       }
 
+      // Support both media-state-change and update-media-state
+      case 'media-state-change':
       case 'update-media-state': {
         if (!this.roomId) return;
-        const { isAudioMuted, isVideoMuted } = data;
+        const { isAudioMuted, isVideoMuted } = data || {};
         if (this.currentUser) {
           this.currentUser.isAudioMuted = isAudioMuted;
           this.currentUser.isVideoMuted = isVideoMuted;
@@ -430,25 +566,36 @@ export class ServerlessSignalingSocket implements SignalingSocket {
           isAudioMuted,
           isVideoMuted,
         });
+        this.trigger('user-media-state', {
+          socketId: this.id,
+          isAudioMuted,
+          isVideoMuted,
+        });
         break;
       }
 
+      // Support both chat-message and send-chat
+      case 'chat-message':
       case 'send-chat': {
         if (!this.roomId) return;
+        const textContent = typeof data === 'string' ? data : (data?.text || '');
+        if (!textContent.trim()) return;
+
         const chatMsg = {
           id: `msg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
           senderId: this.id,
           senderName: this.currentUser?.displayName || 'Friend',
           senderAvatar: this.currentUser?.avatar || '🍿',
-          text: data.text,
+          text: textContent.trim(),
           timestamp: Date.now(),
         };
+
         this.publish(`syncstream/v2/${this.roomId}/all`, {
           type: 'chat-message',
           senderSocketId: this.id,
           message: chatMsg,
         });
-        // Trigger locally as well
+        // Optimistically trigger locally
         this.trigger('chat-message', chatMsg);
         break;
       }
@@ -469,30 +616,75 @@ export class ServerlessSignalingSocket implements SignalingSocket {
         this.trigger('reaction', reactionData);
         break;
       }
+
+      case 'soundcheck-ping': {
+        if (!this.roomId) return;
+        const pingPayload = {
+          type: 'soundcheck-ping',
+          senderSocketId: this.id,
+          senderName: data?.senderName || this.currentUser?.displayName || 'Friend',
+          timestamp: Date.now(),
+        };
+        this.publish(`syncstream/v2/${this.roomId}/all`, pingPayload);
+        this.peers.forEach((_peer, peerId) => {
+          this.publish(`syncstream/v2/${this.roomId}/peer/${peerId}`, pingPayload);
+        });
+        break;
+      }
+
+      case 'leave-room':
+      case 'leave': {
+        this.broadcastLeave();
+        break;
+      }
     }
   }
 
-  public disconnect() {
+  private broadcastLeave() {
     if (this.roomId && this.isConnected) {
+      console.log(`[P2P Signaling] Broadcasting user-left for:`, this.id);
       this.publish(`syncstream/v2/${this.roomId}/all`, {
         type: 'user-left',
         senderSocketId: this.id,
         socketId: this.id,
-        displayName: this.currentUser?.displayName,
+        displayName: this.currentUser?.displayName || 'Friend',
       });
+    }
+  }
+
+  public disconnect() {
+    this.broadcastLeave();
+
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+    if (this.staleCheckInterval) {
+      clearInterval(this.staleCheckInterval);
+      this.staleCheckInterval = null;
+    }
+    if (this.unloadHandler && typeof window !== 'undefined') {
+      window.removeEventListener('beforeunload', this.unloadHandler);
+      window.removeEventListener('pagehide', this.unloadHandler);
+      this.unloadHandler = null;
     }
 
     if (this.client) {
-      try {
-        this.client.end(true);
-      } catch (e) {
-        console.warn('Error ending client:', e);
-      }
-      this.client = null;
+      // Small delay to allow final MQTT publish to exit the socket buffer
+      setTimeout(() => {
+        try {
+          this.client?.end(false);
+        } catch (e) {
+          console.warn('Error ending client:', e);
+        }
+        this.client = null;
+      }, 150);
     }
+
     this.isConnected = false;
     this.hasJoinedRoom = false;
     this.peers.clear();
+    this.peerLastSeen.clear();
     this.activeScreenSharer = null;
   }
 }

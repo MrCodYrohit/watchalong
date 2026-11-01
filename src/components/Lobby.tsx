@@ -12,12 +12,14 @@ import {
   Copy,
   Check,
   Share2,
-  Info
+  Info,
+  Lock,
 } from 'lucide-react';
 
 interface LobbyProps {
   initialRoomId?: string;
   isInviteLink?: boolean;
+  hasPasscode?: boolean;
   onJoinRoom: (params: {
     roomId: string;
     displayName: string;
@@ -43,12 +45,14 @@ const DEFAULT_NAMES = [
 export const Lobby: React.FC<LobbyProps> = ({
   initialRoomId = '',
   isInviteLink = false,
+  hasPasscode = false,
   onJoinRoom,
+  onBackToGate,
 }) => {
   const [roomId, setRoomId] = useState(
-    initialRoomId || `party-${Math.random().toString(36).substring(2, 6)}`
+    initialRoomId || (hasPasscode ? `party-${Math.random().toString(36).substring(2, 6)}` : '')
   );
-  const [isCreatingNew, setIsCreatingNew] = useState(!initialRoomId);
+  const [isCreatingNew, setIsCreatingNew] = useState(hasPasscode && !initialRoomId);
   const [displayName, setDisplayName] = useState(() => {
     return (
       localStorage.getItem('syncstream_name') ||
@@ -317,53 +321,82 @@ export const Lobby: React.FC<LobbyProps> = ({
 
           {/* Right: Room & Profile Settings */}
           <div className="md:col-span-6 space-y-5">
-            {/* Tab switch: Create New Room vs Join Room */}
-            <div className="flex rounded-xl bg-zinc-950 p-1 border border-zinc-800">
-              <button
-                type="button"
-                onClick={() => {
-                  setIsCreatingNew(true);
-                  if (!initialRoomId) {
-                    setRoomId(`party-${Math.random().toString(36).substring(2, 6)}`);
-                  }
-                }}
-                className={`flex-1 py-2 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
-                  isCreatingNew
-                    ? 'bg-zinc-800 text-white shadow-sm'
-                    : 'text-zinc-400 hover:text-white'
-                }`}
-              >
-                Create New Room
-              </button>
-              <button
-                type="button"
-                onClick={() => setIsCreatingNew(false)}
-                className={`flex-1 py-2 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
-                  !isCreatingNew
-                    ? 'bg-zinc-800 text-white shadow-sm'
-                    : 'text-zinc-400 hover:text-white'
-                }`}
-              >
-                Join Existing Room
-              </button>
-            </div>
+            {/* Tab switch: Only users who authenticated with passcode can create rooms */}
+            {hasPasscode ? (
+              <div className="flex rounded-xl bg-zinc-950 p-1 border border-zinc-800">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsCreatingNew(true);
+                    if (!initialRoomId) {
+                      setRoomId(`party-${Math.random().toString(36).substring(2, 6)}`);
+                    }
+                  }}
+                  className={`flex-1 py-2 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                    isCreatingNew
+                      ? 'bg-zinc-800 text-white shadow-sm'
+                      : 'text-zinc-400 hover:text-white'
+                  }`}
+                >
+                  Create New Room
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIsCreatingNew(false)}
+                  className={`flex-1 py-2 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                    !isCreatingNew
+                      ? 'bg-zinc-800 text-white shadow-sm'
+                      : 'text-zinc-400 hover:text-white'
+                  }`}
+                >
+                  Join Existing Room
+                </button>
+              </div>
+            ) : (
+              <div className="p-3 rounded-xl bg-zinc-950/80 border border-zinc-800 flex items-center justify-between text-xs">
+                <div className="flex items-center gap-2 text-zinc-300">
+                  <Lock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                  <span>Joining party as invited guest</span>
+                </div>
+                {onBackToGate && (
+                  <button
+                    type="button"
+                    onClick={onBackToGate}
+                    className="text-[11px] font-semibold text-rose-400 hover:text-rose-300 hover:underline cursor-pointer"
+                  >
+                    Enter secret to host
+                  </button>
+                )}
+              </div>
+            )}
 
             <form onSubmit={handleJoin} className="space-y-4">
               {/* Room ID Input */}
               <div>
-                <label className="block text-xs font-medium text-zinc-300 mb-1.5">
-                  {isCreatingNew ? 'Room Code' : 'Enter Room Code'}
+                <label className="block text-xs font-medium text-zinc-300 mb-1.5 flex items-center justify-between">
+                  <span>{isCreatingNew ? 'Room Code' : 'Watch Party Room Code'}</span>
+                  {!hasPasscode && (
+                    <span className="text-[10px] text-amber-400 flex items-center gap-1 font-mono">
+                      <Lock className="w-3 h-3" />
+                      Locked to invited room
+                    </span>
+                  )}
                 </label>
                 <div className="flex gap-2">
                   <input
                     type="text"
                     value={roomId}
-                    onChange={(e) => setRoomId(e.target.value.toLowerCase().replace(/\s+/g, '-'))}
+                    readOnly={!hasPasscode}
+                    onChange={(e) => hasPasscode && setRoomId(e.target.value.toLowerCase().replace(/\s+/g, '-'))}
                     placeholder="e.g. friday-movie-night"
-                    className="flex-1 px-3.5 py-2.5 rounded-xl bg-zinc-950 border border-zinc-800 text-white font-mono text-sm placeholder-zinc-500 focus:outline-none focus:border-rose-500"
+                    className={`flex-1 px-3.5 py-2.5 rounded-xl border font-mono text-sm placeholder-zinc-500 focus:outline-none ${
+                      !hasPasscode
+                        ? 'bg-zinc-950/50 border-zinc-800/60 text-zinc-400 cursor-not-allowed select-none'
+                        : 'bg-zinc-950 border-zinc-800 text-white focus:border-rose-500'
+                    }`}
                     required
                   />
-                  {isCreatingNew && (
+                  {hasPasscode && isCreatingNew && (
                     <button
                       type="button"
                       onClick={() =>
@@ -427,6 +460,13 @@ export const Lobby: React.FC<LobbyProps> = ({
                   When you click <strong>Share Screen</strong>, pick &ldquo;Chrome Tab&rdquo; and check &ldquo;Also share tab audio&rdquo; so friends hear the movie sound!
                 </p>
               </div>
+
+              {isInviteLink && (
+                <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs">
+                  <Sparkles className="w-3.5 h-3.5 shrink-0 text-amber-300" />
+                  <span>Joining via invite link. Active while friends are in the room.</span>
+                </div>
+              )}
 
               {/* Join / Start Button */}
               <button

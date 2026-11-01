@@ -1,5 +1,5 @@
 import React from 'react';
-import { X, Volume2, ShieldAlert, Check, Monitor, Sparkles } from 'lucide-react';
+import { X, Volume2, Monitor } from 'lucide-react';
 
 interface ScreenShareGuideModalProps {
   isOpen: boolean;
@@ -54,16 +54,15 @@ export const ScreenShareGuideModal: React.FC<ScreenShareGuideModalProps> = ({
             </div>
           </div>
 
-          <div className="p-3.5 rounded-2xl bg-rose-500/10 border border-rose-500/30 flex items-start gap-3">
-            <div className="w-6 h-6 rounded-full bg-rose-500 text-white text-xs font-bold flex items-center justify-center shrink-0 mt-0.5">
+          <div className="p-3.5 rounded-2xl bg-zinc-950 border border-zinc-800/80 flex items-start gap-3">
+            <div className="w-6 h-6 rounded-full bg-rose-500/20 text-rose-400 text-xs font-bold flex items-center justify-center shrink-0 mt-0.5">
               2
             </div>
             <div>
-              <div className="text-xs font-semibold text-rose-300 flex items-center gap-1.5">
-                <span>Check &ldquo;Also share tab audio&rdquo;</span>
-                <Sparkles className="w-3.5 h-3.5 text-amber-300" />
+              <div className="text-xs font-semibold text-zinc-200">
+                Check &ldquo;Also share tab audio&rdquo;
               </div>
-              <p className="text-[11px] text-zinc-300 mt-0.5">
+              <p className="text-[11px] text-zinc-400 mt-0.5">
                 Look at the bottom left of the browser share prompt and make sure the <strong>Share audio</strong> toggle or checkbox is turned ON!
               </p>
             </div>

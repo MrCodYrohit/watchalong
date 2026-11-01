@@ -6,6 +6,9 @@ const ICE_SERVERS: RTCConfiguration = {
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun4.l.google.com:19302' },
+    { urls: 'stun:global.stun.twilio.com:3478' },
   ],
 };
 
@@ -39,7 +42,6 @@ function boostSdpBitrate(sdp: string, bitrateKbps: number = 25000): string {
     } else if (line.startsWith('m=') && inVideoSection) {
       inVideoSection = false;
     }
-    // Remove existing lower b=AS lines
     if (inVideoSection && (line.startsWith('b=AS:') || line.startsWith('b=TIAS:'))) {
       continue;
     }
@@ -53,6 +55,7 @@ export class WebRTCManager {
   private localSocketId: string = '';
   private camPeers: Map<string, RTCPeerConnection> = new Map();
   private screenPeers: Map<string, RTCPeerConnection> = new Map();
+  private remoteCamMediaStreams: Map<string, MediaStream> = new Map();
 
   // Candidate queues to eliminate ICE race conditions
   private pendingCamCandidates: Map<string, RTCIceCandidateInit[]> = new Map();
@@ -110,6 +113,7 @@ export class WebRTCManager {
     }
     const existingPc = this.camPeers.get(targetSocketId);
     if (existingPc && (existingPc.connectionState === 'connected' || existingPc.signalingState === 'have-local-offer')) {
+      console.log(`[WebRTC] Cam connection with ${targetSocketId} already active or pending offer.`);
       return;
     }
     if (existingPc) {
@@ -131,20 +135,35 @@ export class WebRTCManager {
     };
 
     pc.ontrack = (event) => {
-      const stream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream([event.track]);
+      let stream = this.remoteCamMediaStreams.get(targetSocketId);
+      if (!stream) {
+        stream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream();
+        this.remoteCamMediaStreams.set(targetSocketId, stream);
+      }
+      if (!stream.getTracks().some((t) => t.id === event.track.id)) {
+        stream.addTrack(event.track);
+      }
+      console.log(`[WebRTC] Received remote ${event.track.kind} track from ${targetSocketId}`);
       this.events.onRemoteCamStream?.(targetSocketId, stream);
     };
 
+    // Add audio and video transceivers upfront so SDP negotiation is fully bidirectional
+    const audioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
+    const videoTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
+
+    // If local cam/mic tracks are already active, attach them immediately
     if (this.localCamStream) {
-      this.localCamStream.getTracks().forEach((track) => {
-        pc.addTrack(track, this.localCamStream!);
-      });
+      const aTrack = this.localCamStream.getAudioTracks()[0];
+      if (aTrack && audioTransceiver.sender) {
+        audioTransceiver.sender.replaceTrack(aTrack).catch(() => {});
+      }
+      const vTrack = this.localCamStream.getVideoTracks()[0];
+      if (vTrack && videoTransceiver.sender) {
+        videoTransceiver.sender.replaceTrack(vTrack).catch(() => {});
+      }
     }
 
-    const offer = await pc.createOffer({
-      offerToReceiveAudio: true,
-      offerToReceiveVideo: true,
-    });
+    const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
 
     this.socket.emit('signal', {
@@ -159,30 +178,66 @@ export class WebRTCManager {
     let pc = this.camPeers.get(senderSocketId);
 
     if (type === 'offer') {
-      if (pc) this.closeCamPeer(senderSocketId);
-      pc = new RTCPeerConnection(ICE_SERVERS);
-      this.camPeers.set(senderSocketId, pc);
-
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          this.socket.emit('signal', {
-            targetSocketId: senderSocketId,
-            signalData: event.candidate.toJSON(),
-            type: 'candidate',
-            streamKind: 'cam',
-          });
+      const isOfferCollision = pc && pc.signalingState !== 'stable';
+      if (isOfferCollision) {
+        // Perfect negotiation tie-breaker: polite peer yields if local id is lower
+        const isPolite = this.localSocketId < senderSocketId;
+        if (!isPolite) {
+          console.log(`[WebRTC] Glare detected with ${senderSocketId}: ignoring impolite offer.`);
+          return;
         }
-      };
+        console.log(`[WebRTC] Glare detected with ${senderSocketId}: polite peer accepting offer.`);
+        this.closeCamPeer(senderSocketId);
+        pc = undefined;
+      }
 
-      pc.ontrack = (event) => {
-        const stream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream([event.track]);
-        this.events.onRemoteCamStream?.(senderSocketId, stream);
-      };
+      if (!pc) {
+        pc = new RTCPeerConnection(ICE_SERVERS);
+        this.camPeers.set(senderSocketId, pc);
 
-      if (this.localCamStream) {
-        this.localCamStream.getTracks().forEach((track) => {
-          pc!.addTrack(track, this.localCamStream!);
-        });
+        pc.onicecandidate = (event) => {
+          if (event.candidate) {
+            this.socket.emit('signal', {
+              targetSocketId: senderSocketId,
+              signalData: event.candidate.toJSON(),
+              type: 'candidate',
+              streamKind: 'cam',
+            });
+          }
+        };
+
+        pc.ontrack = (event) => {
+          let stream = this.remoteCamMediaStreams.get(senderSocketId);
+          if (!stream) {
+            stream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream();
+            this.remoteCamMediaStreams.set(senderSocketId, stream);
+          }
+          if (!stream.getTracks().some((t) => t.id === event.track.id)) {
+            stream.addTrack(event.track);
+          }
+          console.log(`[WebRTC] Received remote ${event.track.kind} track from ${senderSocketId}`);
+          this.events.onRemoteCamStream?.(senderSocketId, stream);
+        };
+      }
+
+      // Add transceivers or attach tracks
+      const senders = pc.getSenders();
+      const hasAudioSender = senders.some((s) => s.track?.kind === 'audio');
+      const hasVideoSender = senders.some((s) => s.track?.kind === 'video');
+
+      if (!hasAudioSender) {
+        const audioTransceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
+        const aTrack = this.localCamStream?.getAudioTracks()[0];
+        if (aTrack && audioTransceiver.sender) {
+          audioTransceiver.sender.replaceTrack(aTrack).catch(() => {});
+        }
+      }
+      if (!hasVideoSender) {
+        const videoTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
+        const vTrack = this.localCamStream?.getVideoTracks()[0];
+        if (vTrack && videoTransceiver.sender) {
+          videoTransceiver.sender.replaceTrack(vTrack).catch(() => {});
+        }
       }
 
       await pc.setRemoteDescription(new RTCSessionDescription(signalData as RTCSessionDescriptionInit));
@@ -207,7 +262,7 @@ export class WebRTCManager {
         streamKind: 'cam',
       });
     } else if (type === 'answer') {
-      if (pc && pc.signalingState !== 'stable') {
+      if (pc && pc.signalingState === 'have-local-offer') {
         await pc.setRemoteDescription(new RTCSessionDescription(signalData as RTCSessionDescriptionInit));
         const queued = this.pendingCamCandidates.get(senderSocketId) || [];
         for (const cand of queued) {
@@ -218,6 +273,7 @@ export class WebRTCManager {
           }
         }
         this.pendingCamCandidates.delete(senderSocketId);
+        console.log(`[WebRTC] Camera peer connection established with ${senderSocketId}`);
       }
     } else if (type === 'candidate') {
       if (pc && pc.remoteDescription) {
@@ -238,10 +294,9 @@ export class WebRTCManager {
   async broadcastScreenShare(screenStream: MediaStream, participantSocketIds: string[]) {
     this.localScreenStream = screenStream;
 
-    // Hint browser engine to preserve razor-sharp text and high-frequency details
     const vTrack = screenStream.getVideoTracks()[0];
     if (vTrack) {
-      vTrack.contentHint = 'detail'; // 'detail' prioritizes sharp text & high resolution over frame drops
+      vTrack.contentHint = 'detail';
     }
     const aTrack = screenStream.getAudioTracks()[0];
     if (aTrack) {
@@ -254,7 +309,6 @@ export class WebRTCManager {
     }
   }
 
-  // Public method to send screen stream to any new or requesting participant
   async sendScreenStreamTo(targetSocketId: string, screenStream?: MediaStream) {
     if (!targetSocketId || targetSocketId === this.localSocketId || targetSocketId === 'self') {
       return;
@@ -267,12 +321,11 @@ export class WebRTCManager {
 
     const existingPc = this.screenPeers.get(targetSocketId);
     if (existingPc) {
-      // Prevent glare: do NOT abort if negotiation is already actively underway or connected!
       if (
         existingPc.connectionState === 'connected' ||
         existingPc.signalingState === 'have-local-offer'
       ) {
-        console.log(`[WebRTC] Screen peer ${targetSocketId} is already in state: ${existingPc.signalingState} / ${existingPc.connectionState}. Skipping duplicate offer.`);
+        console.log(`[WebRTC] Screen peer ${targetSocketId} already connected/pending.`);
         return;
       }
       this.closeScreenPeer(targetSocketId);
@@ -282,7 +335,6 @@ export class WebRTCManager {
     this.screenPeers.set(targetSocketId, pc);
 
     pc.onconnectionstatechange = () => {
-      console.log(`🔌 [Screen Sender PC] State with ${targetSocketId}:`, pc.connectionState);
       this.events.onScreenConnectionState?.(targetSocketId, pc.connectionState);
     };
 
@@ -297,18 +349,15 @@ export class WebRTCManager {
       }
     };
 
-    // Add screen tracks (video and system/tab audio)
     stream.getTracks().forEach((track) => {
       if (track.kind === 'video') {
         track.contentHint = 'detail';
       } else if (track.kind === 'audio') {
         track.contentHint = 'music';
       }
-      console.log(`🎬 Adding track to screen peer (${targetSocketId}):`, track.kind, track.label);
       pc.addTrack(track, stream);
     });
 
-    // Enforce ultra-high bitrate & maintain-resolution to keep text razor sharp
     const videoSender = pc.getSenders().find((s) => s.track?.kind === 'video');
     if (videoSender) {
       try {
@@ -316,11 +365,10 @@ export class WebRTCManager {
         if (!params.encodings || params.encodings.length === 0) {
           params.encodings = [{}];
         }
-        params.encodings[0].maxBitrate = 25000000; // 25 Mbps bandwidth limit
+        params.encodings[0].maxBitrate = 25000000; // 25 Mbps
         params.encodings[0].maxFramerate = 60;
-        params.degradationPreference = 'maintain-resolution'; // NEVER downscale resolution or blur text!
+        params.degradationPreference = 'maintain-resolution';
         await videoSender.setParameters(params);
-        console.log('🚀 Applied 25Mbps bitrate and maintain-resolution for crystal-clear text');
       } catch (err) {
         console.warn('Could not set video sender parameters:', err);
       }
@@ -332,7 +380,6 @@ export class WebRTCManager {
     }
     await pc.setLocalDescription(offer);
 
-    console.log(`📡 Sending screen offer to: ${targetSocketId}`);
     this.socket.emit('signal', {
       targetSocketId,
       signalData: offer,
@@ -345,10 +392,8 @@ export class WebRTCManager {
     let pc = this.screenPeers.get(senderSocketId);
 
     if (type === 'offer') {
-      console.log(`📥 Received screen offer from ${senderSocketId}`);
       if (pc) {
         if (pc.connectionState === 'connected') {
-          console.log(`[WebRTC] Already connected to ${senderSocketId}, ignoring duplicate offer.`);
           return;
         }
         this.closeScreenPeer(senderSocketId);
@@ -358,7 +403,6 @@ export class WebRTCManager {
       this.screenPeers.set(senderSocketId, pc);
 
       pc.onconnectionstatechange = () => {
-        console.log(`🔌 [Screen Receiver PC] State with ${senderSocketId}:`, pc!.connectionState);
         this.events.onScreenConnectionState?.(senderSocketId, pc!.connectionState);
       };
 
@@ -374,7 +418,6 @@ export class WebRTCManager {
       };
 
       pc.ontrack = (event) => {
-        console.log('🎥 [Screen Receiver] Track received:', event.track.kind, event.streams);
         let stream = (event.streams && event.streams[0]) ? event.streams[0] : null;
         if (!stream) {
           stream = new MediaStream();
@@ -385,7 +428,6 @@ export class WebRTCManager {
 
       await pc.setRemoteDescription(new RTCSessionDescription(signalData as RTCSessionDescriptionInit));
 
-      // Flush queued candidates
       const queued = this.pendingScreenCandidates.get(senderSocketId) || [];
       for (const cand of queued) {
         try {
@@ -402,7 +444,6 @@ export class WebRTCManager {
       }
       await pc.setLocalDescription(answer);
 
-      console.log(`📡 Sending screen answer to: ${senderSocketId}`);
       this.socket.emit('signal', {
         targetSocketId: senderSocketId,
         signalData: answer,
@@ -410,21 +451,17 @@ export class WebRTCManager {
         streamKind: 'screen',
       });
     } else if (type === 'answer') {
-      console.log(`📥 Received screen answer from ${senderSocketId}`);
-      if (pc) {
-        if (pc.signalingState === 'have-local-offer') {
-          await pc.setRemoteDescription(new RTCSessionDescription(signalData as RTCSessionDescriptionInit));
-          const queued = this.pendingScreenCandidates.get(senderSocketId) || [];
-          for (const cand of queued) {
-            try {
-              await pc.addIceCandidate(new RTCIceCandidate(cand));
-            } catch (e) {
-              console.warn('Failed adding queued screen candidate:', e);
-            }
+      if (pc && pc.signalingState === 'have-local-offer') {
+        await pc.setRemoteDescription(new RTCSessionDescription(signalData as RTCSessionDescriptionInit));
+        const queued = this.pendingScreenCandidates.get(senderSocketId) || [];
+        for (const cand of queued) {
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(cand));
+          } catch (e) {
+            console.warn('Failed adding queued screen candidate:', e);
           }
-          this.pendingScreenCandidates.delete(senderSocketId);
-          console.log(`✅ WebRTC Screen negotiation completed with ${senderSocketId}`);
         }
+        this.pendingScreenCandidates.delete(senderSocketId);
       }
     } else if (type === 'candidate') {
       if (pc && pc.remoteDescription) {
@@ -441,21 +478,52 @@ export class WebRTCManager {
     }
   }
 
-  // Update local cam stream tracks
+  // Update local cam stream tracks across all active cam peers
   updateLocalCamStream(stream: MediaStream | null) {
     this.localCamStream = stream;
     if (!stream) return;
 
+    const audioTrack = stream.getAudioTracks()[0];
+    const videoTrack = stream.getVideoTracks()[0];
+
     this.camPeers.forEach((pc) => {
-      const senders = pc.getSenders();
-      stream.getTracks().forEach((newTrack) => {
-        const sender = senders.find((s) => s.track?.kind === newTrack.kind);
-        if (sender) {
-          sender.replaceTrack(newTrack);
+      const transceivers = typeof pc.getTransceivers === 'function' ? pc.getTransceivers() : [];
+      const audioTransceiver = transceivers.find(
+        (t) => t.receiver?.track?.kind === 'audio' || t.sender?.track?.kind === 'audio'
+      );
+      const videoTransceiver = transceivers.find(
+        (t) => t.receiver?.track?.kind === 'video' || t.sender?.track?.kind === 'video'
+      );
+
+      if (audioTrack) {
+        if (audioTransceiver?.sender) {
+          audioTransceiver.sender.replaceTrack(audioTrack).catch((err) => {
+            console.warn('[WebRTC] replaceTrack audio error:', err);
+          });
         } else {
-          pc.addTrack(newTrack, stream);
+          const aSender = pc.getSenders().find((s) => s.track?.kind === 'audio');
+          if (aSender) {
+            aSender.replaceTrack(audioTrack).catch((err) => console.warn('[WebRTC] replaceTrack audio err:', err));
+          } else {
+            try { pc.addTrack(audioTrack, stream); } catch (_) {}
+          }
         }
-      });
+      }
+
+      if (videoTrack) {
+        if (videoTransceiver?.sender) {
+          videoTransceiver.sender.replaceTrack(videoTrack).catch((err) => {
+            console.warn('[WebRTC] replaceTrack video error:', err);
+          });
+        } else {
+          const vSender = pc.getSenders().find((s) => s.track?.kind === 'video');
+          if (vSender) {
+            vSender.replaceTrack(videoTrack).catch((err) => console.warn('[WebRTC] replaceTrack video err:', err));
+          } else {
+            try { pc.addTrack(videoTrack, stream); } catch (_) {}
+          }
+        }
+      }
     });
   }
 
@@ -465,6 +533,7 @@ export class WebRTCManager {
       pc.close();
       this.camPeers.delete(socketId);
     }
+    this.remoteCamMediaStreams.delete(socketId);
     this.pendingCamCandidates.delete(socketId);
   }
 
@@ -495,6 +564,7 @@ export class WebRTCManager {
     }
     this.camPeers.forEach((pc) => pc.close());
     this.camPeers.clear();
+    this.remoteCamMediaStreams.clear();
     this.pendingCamCandidates.clear();
   }
 }

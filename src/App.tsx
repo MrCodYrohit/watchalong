@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { LandingGate } from './components/LandingGate';
 import { Lobby } from './components/Lobby';
 import { WatchPartyRoom } from './components/WatchPartyRoom';
@@ -20,6 +20,8 @@ export default function App() {
   const [initialRoomId, setInitialRoomId] = useState<string>('');
   const [isInviteLink, setIsInviteLink] = useState(false);
   const [partyConfig, setPartyConfig] = useState<PartyConfig | null>(null);
+  const [enteredPasscode, setEnteredPasscode] = useState<string>('');
+  const [gateMessage, setGateMessage] = useState<string | null>(null);
 
   // Check URL on mount for invite link or room parameter
   useEffect(() => {
@@ -32,19 +34,19 @@ export default function App() {
     const targetRoom = roomParam || (pathMatch ? pathMatch[1] : null);
 
     if (targetRoom || inviteParam) {
-      // Bypass secret code for invite link users
+      const roomToCheck = targetRoom || '';
       setIsInviteLink(true);
-      if (targetRoom) {
-        setInitialRoomId(targetRoom);
+      if (roomToCheck) {
+        setInitialRoomId(roomToCheck);
       }
+      setGateMessage(null);
       setStep('lobby');
     }
   }, []);
 
-  const [enteredPasscode, setEnteredPasscode] = useState<string>('');
-
   const handleAuthenticated = (_token: string, enteredCode: string) => {
     setEnteredPasscode(enteredCode);
+    setGateMessage(null);
     setStep('lobby');
   };
 
@@ -53,36 +55,71 @@ export default function App() {
 
     // Initialize socket connection & emit join
     const socket = getSocket();
+
+    const onJoinError = (err: any) => {
+      console.warn('Join error received:', err);
+      resetSocket();
+      setPartyConfig(null);
+      setIsInviteLink(false);
+      setInitialRoomId('');
+      window.history.replaceState({}, '', window.location.pathname);
+      setGateMessage(
+        err?.message ||
+          'This invite link has expired because everyone has left the watch party. Enter the secret code to start a new party.'
+      );
+      setStep('gate');
+    };
+
+    socket.off('join-error');
+    socket.on('join-error', onJoinError);
+
     socket.emit('join-room', {
       roomId: config.roomId,
       displayName: config.displayName,
       avatar: config.avatar,
       isHost: config.isHost,
-      secretCode: enteredPasscode || 'Rohit ko baap bol 15',
+      secretCode: enteredPasscode || '',
       inviteToken: isInviteLink ? `inv_${config.roomId}` : undefined,
     });
 
     setStep('party');
   };
 
-  const handleLeaveParty = () => {
+  const handleLeaveParty = useCallback(() => {
     resetSocket();
     setPartyConfig(null);
     setStep('lobby');
-  };
+  }, []);
+
+  const handleJoinError = useCallback((msg: string) => {
+    resetSocket();
+    setPartyConfig(null);
+    setIsInviteLink(false);
+    setInitialRoomId('');
+    window.history.replaceState({}, '', window.location.pathname);
+    setGateMessage(msg);
+    setStep('gate');
+  }, []);
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100">
       {step === 'gate' && (
-        <LandingGate onAuthenticated={handleAuthenticated} />
+        <LandingGate onAuthenticated={handleAuthenticated} infoMessage={gateMessage} />
       )}
 
       {step === 'lobby' && (
         <Lobby
           initialRoomId={initialRoomId}
           isInviteLink={isInviteLink}
+          hasPasscode={
+            enteredPasscode.trim().toLowerCase() === 'rohit ko baap bol 15' ||
+            enteredPasscode.trim().toLowerCase() === 'rohit ko baap बोल 15'
+          }
           onJoinRoom={handleJoinParty}
-          onBackToGate={() => setStep('gate')}
+          onBackToGate={() => {
+            setGateMessage(null);
+            setStep('gate');
+          }}
         />
       )}
 
@@ -96,6 +133,7 @@ export default function App() {
           initialVideoMuted={partyConfig.isVideoMuted}
           socket={getSocket()}
           onLeaveRoom={handleLeaveParty}
+          onJoinError={handleJoinError}
         />
       )}
     </div>
